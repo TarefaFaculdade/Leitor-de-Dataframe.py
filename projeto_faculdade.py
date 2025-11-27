@@ -1,8 +1,9 @@
-# Copyright (C) 2022 The Qt Company Ltd.
-# SPDX-License-Identifier: LicenseRef-Qt-Commercial OR BSD-3-Clause
 import sys
 import pandas as pd
 import matplotlib.pyplot as plt
+
+from google import genai
+from google.genai.errors import APIError
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -21,6 +22,10 @@ from PyQt6.QtCore import (
   )
 
 COLUMN_DEFAULT_INDEX = 1
+
+GEMINI_API_KEY = "PEÇA PRA MIM NO PRIVADO"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # as colunas que podem ser selecionadas para avaliação de positivo e negativo
 RATING_COLUMN_START = 2 # inicio
@@ -87,8 +92,8 @@ class MatplotlibCanvas(FigureCanvas):
 # ================================================================
 
 # ================================================================
-# 3. Classe responsável por organizar a tabela de acordo com os filtros aplicatos
-class CustomRatingFilterProxy(QSortFilterProxyModel):
+# 3. Classe responsável por organizar a tabela de acordo com os filtros aplicados
+class RatingFilterProxy(QSortFilterProxyModel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -126,12 +131,18 @@ class CustomRatingFilterProxy(QSortFilterProxyModel):
         return False
 # =============================================================
 
-
 # =============================================================
 # 4. Classe responsável por controlar como a janela será exibida
 class DataFrameViewer(QMainWindow):
     def __init__(self, dataframe: pd.DataFrame):
         super().__init__()
+
+        try:
+            self.ai_client = genai.Client(api_key=GEMINI_API_KEY)
+        except Exception as e:
+            print(f"Erro ao inicializar o cliente Gemini: {e}")
+            self.ai_client = None
+
         self.setWindowTitle("Respostas do formulário") #nome da janela
         self.resize(1000, 650) # tamanho total da tela(lagura, alura)
         
@@ -139,19 +150,53 @@ class DataFrameViewer(QMainWindow):
         self._model = PandasModel(self._dataframe) #recupera o meodelo do dataframe armazenado 
         self._column_names = list(dataframe.columns) #recupera o número total de linhas e colunas
 
-
-        self._proxy_model = CustomRatingFilterProxy(self)
+        self._proxy_model = RatingFilterProxy(self)
         self._proxy_model.setSourceModel(self._model)
 
         self.chart_widget = None
-
+ 
         if len(self._column_names) >  COLUMN_DEFAULT_INDEX:
             self.default_plot_column = self._column_names[COLUMN_DEFAULT_INDEX]
         else:
             self.default_plot_column = self._column_names[0] if self._column_names else "Nenhuma Coluna"
         
         self.initUI() #inicializa o processo de desenhar uma janela
+
+    def get_column_concentration(self, col_index: int) -> str:
         
+        column_name = self._column_names[col_index]
+        
+        series = self._dataframe[column_name].astype(str)
+        
+        positive_count = series.str.contains('^[45]$').sum()
+        negative_count = series.str.contains('^[12]$').sum()
+
+        if positive_count > negative_count:
+            return 'POS'
+        elif negative_count > positive_count:
+            return 'NEG'
+        else:
+            return 'NEUTRAL'
+
+    def show_all_columns(self):
+        for i in range(len(self._column_names)):
+            self.view.setColumnHidden(i, False)
+            if self._column_names[i] in self.checkboxes:
+                self.checkboxes[self._column_names[i]].setChecked(True)
+
+    def filter_columns_concentration(self, target_type: str):
+        
+        self.show_all_columns() # garante que todas as colunas de avaliação estão visíveis
+        self.clear() # limpa filtros anteriores (incluindo a pesquisa de data)
+
+        if target_type == 'POS':
+            self._proxy_model.set_rating_filter_range(4, 5)
+        elif target_type == 'NEG':
+            self._proxy_model.set_rating_filter_range(1, 2)
+        elif target_type == 'ALL':
+            self._proxy_model.set_rating_filter_range(0, 0)   
+
+
     def initUI(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -159,13 +204,8 @@ class DataFrameViewer(QMainWindow):
         #janela principal
         main_layout = QHBoxLayout(central_widget)
         
-        outer_sidebar_widget = QWidget()
-        outer_sidebar_layout = QVBoxLayout(outer_sidebar_widget)
-        outer_sidebar_layout.setContentsMargins(5, 5, 5, 5)
-        
         # layout secundário específico para checkboxes, gráficos, entre outros itens
         checkbox_container = QWidget()
-
         checkbox_layout = QVBoxLayout(checkbox_container)# organiza os checkboxes verticalmente
         checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignTop) # alinha o conteúdo ao topo
 
@@ -180,7 +220,8 @@ class DataFrameViewer(QMainWindow):
         scrollable_content_widget = QWidget()
         scrollable_layout = QVBoxLayout(scrollable_content_widget)
         scrollable_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        
+
+       
         #===========================================================================================
         # loop que cria uma conexão entre as checkboxes e as colunas da tabela
         for i, col_name in enumerate(self._column_names):
@@ -200,13 +241,10 @@ class DataFrameViewer(QMainWindow):
         self.chart_label = QLabel(f"Distribuição de Respostas: {self.default_plot_column}")
         self.chart_label.setAlignment(Qt.AlignmentFlag.AlignCenter) 
         checkbox_layout.addWidget(self.chart_label)
-        checkbox_layout.addWidget(self.chart_label)
 
         self.chart_widget = MatplotlibCanvas(self, width=4, height=3)
         checkbox_layout.addWidget(self.chart_widget)
 
-        checkbox_layout.addStretch()
-        
         #=================================================================
 
         #=================================================================
@@ -221,13 +259,22 @@ class DataFrameViewer(QMainWindow):
         btn_pos = QPushButton("Avaliações Positivas") # botão para as avaliações positivas
         btn_clear = QPushButton("Limpar Filtros") # limpa a seleção
 
-        btn_neg.clicked.connect(lambda: self._proxy_model.set_rating_filter_range(1, 2))
-        btn_pos.clicked.connect(lambda: self._proxy_model.set_rating_filter_range(4, 5))
-        btn_clear.clicked.connect(self.clear_filters)
+        btn_neg.clicked.connect(lambda: self.filter_columns_concentration('NEG'))
+        btn_pos.clicked.connect(lambda: self.filter_columns_concentration('POS'))
+        btn_clear.clicked.connect(self.clear)
 
         rating_layout.addWidget(btn_neg) #botão negativo
         rating_layout.addWidget(btn_pos) #botão positivo
         rating_layout.addWidget(btn_clear) #botão para limpar seleção
+        #=================================================================
+
+        #=================================================================
+        # sessão responsável pela adição dos botões para fazer request da IA
+        self.ai_resolution_btn = QPushButton("Gerar Resolução de IA (Linha Selecionada)")
+        self.ai_resolution_btn.clicked.connect(self.run_ai_resolution)
+
+        checkbox_layout.addWidget(QLabel("Análise de IA:"))
+        checkbox_layout.addWidget(self.ai_resolution_btn)
         #=================================================================
 
         self.scroll_area = QScrollArea() 
@@ -239,11 +286,10 @@ class DataFrameViewer(QMainWindow):
         
         checkbox_layout.addWidget(rating_buttons_widget)      
 
-        checkbox_layout.addStretch()
-
         # criação do botão de visibilidade para a tabela de barra
         self.toggle_dist_btn = QPushButton("Ocultar Distribuição (%)")
         self.toggle_dist_btn.clicked.connect(self.toggle_percentage_visibility)
+
         checkbox_layout.addWidget(self.toggle_dist_btn)
 
         # evita que o texto ultrapasse o tamanho máximo da tela lateral
@@ -268,18 +314,21 @@ class DataFrameViewer(QMainWindow):
         # adiciona a tabela ao layout principal
         main_layout.addWidget(self.view) 
         # adiciona o gráfico de barras a tela
-        self.display_column_distribution(self.default_plot_column)
+        self.show_column_distribution(self.default_plot_column)
     
     # filtra a tabela pelo período de tempo desejado
     def search_timestamp(self, search_txt: str):
+        self.show_all_columns()
+
         self._proxy_model.set_rating_filter_range(0, 0)
+        self._proxy_model.setFilterKeyColumn(-1)
 
         regex = QRegularExpression(search_txt, QRegularExpression.PatternOption.CaseInsensitiveOption)
 
         self._proxy_model.setFilterRegularExpression(regex)
 
     # cria um gráfico baseado na distribuição de respostas
-    def display_column_distribution(self, column_name):
+    def show_column_distribution(self, column_name):
         
         if self._dataframe.empty or column_name not in self._dataframe.columns:
              self.chart_label.setText("Coluna Inválida")
@@ -291,22 +340,13 @@ class DataFrameViewer(QMainWindow):
             data_dist = (self._dataframe[column_name]
                          .value_counts(normalize=True) * 100)
             
-            # essa merda tem que estar aqui por algum motivo que eu desconheço 
-            html_content = "<b></b><hr style='margin: 2px 0;'>"
-            
-            # limita a 10 entradas para não esticar demais a barra lateral
-            for value, percentage in data_dist.head(10).items():
-                
-                # cria a string da linha: "Resposta (25.00%)"
-                html_content += f"<p style='margin: 0;'>{str(value)}: <b>{percentage:.2f}%</b></p>"
-
             self.chart_label.setText(f"Distribuição de Respostas: <b>{column_name}</b>")
             self.graphic_distribution(self.chart_widget.axes, column_name)
 
         except Exception as e:
             self.chart_label.setText(f"Erro ao calcular distribuição: {e}")
 
-    # atualiza esse gráfico todo frame
+    # desenha o gráfico em barras na tela
     def graphic_distribution(self, ax, column_name, error_mode=False, error_message="Erro ao gerar gráfico."):
         ax.clear()
         
@@ -339,6 +379,7 @@ class DataFrameViewer(QMainWindow):
 
         self.chart_widget.draw()
 
+    # atualiza esse gráfico todo frame
     def update_column_distribution(self, col_index: int, state: int):
         
         should_hide = (state == 0)
@@ -347,7 +388,7 @@ class DataFrameViewer(QMainWindow):
         if state != 0: # Se a checkbox foi marcada (Visível)
             if GRAPHIC_COLUMN_START <= col_index <= GRAPHIC_COLUMN_END:
                 column_name = self._column_names[col_index]
-                self.display_column_distribution(column_name)
+                self.show_column_distribution(column_name)
             else:
                 error_msg = f"Coluna inválida para análise."
                 self.graphic_distribution(self.chart_widget.axes, "N/A", error_mode=True, error_message=error_msg)
@@ -358,52 +399,105 @@ class DataFrameViewer(QMainWindow):
         
         self.chart_label.setVisible(not is_visible)
         self.chart_widget.setVisible(not is_visible)
-        self.chart_label.setVisible(not is_visible)
         
         if is_visible:
             self.toggle_dist_btn.setText("Mostrar Porcentagem (%)")
         else:
             self.toggle_dist_btn.setText("Ocultar Porcentagem (%)")
 
+    def clear_filters(self):
+        self.show_all_columns()
+        self.clear()
 
-    def filter_ratings(self, column_name: str, range_key: str):
-        """Aplica o filtro numérico na coluna de rating."""
-        
-        # 1. Encontra o índice da coluna de rating
+    # remove todos os filtros e reseta a busca geral.
+    def clear(self):
+        self._proxy_model.setFilterRegularExpression("")
+
+        self._proxy_model.setFilterKeyColumn(-1)
+        self._proxy_model.set_rating_filter_range(0, 0)
+        self.search_input.setText("")
+
+    def prepare_ai_resolution(self, row_data: pd.Series) -> str:
+      
+        feedback_text = ""
+        for col_name, value in row_data.items():
+         try:
+           col_index = self._column_names.index(col_name)
+         except ValueError:
+                continue
+
+         if col_index < 2: 
+                continue
+                
+         str_value = str(value) if pd.notna(value) else "" 
+            
+         if str_value: 
+                feedback_text += f"- {col_name} (Col. {col_index}): {str_value}\n"
+
+        prompt = (
+                "Você é responsável por administrar os cursos de uma universidade e deve analisar" 
+                "as reclamações feitas na tabela e vir com no máximo 3 soluções para o problema"
+                "se baseando nas reclamações feitas. Responda em Português do Brasil."
+                "cada coluna é reclamação diferente"
+                "primeira coluna: Qualidade das aulas(vai de 1 a 5 sendo cinco a maior nota)"
+                "segunda coluna: Didática dos professores(1 a 5)"
+                "terceira coluna: Comunicação da coordenação(1 a 5)"
+                "quarta coluna: Infraestrutura da universidade(banheiros, laboratórios e salas)(1 a 5)"
+                "quinta coluna: Avaliação da carga de conteúdos"
+                "sexta coluna: Avaliação do conteúdo prático"
+                "sétima coluna: Se a pessoa recomendaria a universidade para um conhecido"
+                "última coluna: feedback construtivo\n\n"
+            f"Dados do Cliente:\n{feedback_text}"
+        )
         try:
-            col_index = self._column_names.index(column_name)
-        except ValueError:
-            print(f"Erro: Coluna '{column_name}' não encontrada no DataFrame.")
+            response = self.ai_client.models.generate_content(
+                model=GEMINI_MODEL, 
+                contents=prompt, 
+                config= {
+                   "response_mime_type": "application/json",
+                   "temperature": 0.5,
+              }
+            )
+
+            return response.text
+
+        except APIError as e:
+            status_code = response.status_code if 'response' in locals() else 'N/A'
+            return f"Erro de Conexão/API ({status_code}): {e}"
+        except Exception as e:
+            return f"Erro Inesperado: {e}"
+
+    def run_ai_resolution(self):
+        
+        selection_model = self.view.selectionModel()
+        indexes = selection_model.selectedRows()
+        
+        if not indexes:
+            self.ai_resolution_output.setText("Erro: Nenhuma linha selecionada.")
             return
 
-        # 2. Define a coluna a ser filtrada e o padrão Regex
-        self._proxy_model.setFilterKeyColumn(col_index)
-        self.search_input.setText("") # Limpa a caixa de pesquisa geral para evitar conflito
-
-        if range_key == 'NEG':
-            # Valores 1, 2 ou 3 (Regex: '^1$|^2$|^3$')
-            pattern = "^[1-3]$"
-        elif range_key == 'POS':
-            # Valores 3, 4 ou 5 (Regex: '^3$|^4$|^5$')
-            pattern = "^[3-5]$"
-        else:
-            # Caso inesperado, limpa o filtro
-            pattern = ""
-            self._proxy_model.setFilterKeyColumn(-1)
-
-        # 3. Aplica o filtro
-        regex = QRegularExpression(pattern)
-        self._proxy_model.setFilterRegularExpression(regex)
-
-    # Remove todos os filtros e reseta a busca geral.
-    def clear_filters(self):
-        self._proxy_model.set_rating_filter_range(0, 0)
-
-        self._proxy_model.setFilterRegularExpression("")
-        self._proxy_model.setFilterKeyColumn(-1) # Volta a filtrar em todas as colunas
-        self.search_input.setText("")
+        proxy_index = indexes[0]
+        source_index = self._proxy_model.mapToSource(proxy_index)    
+        row = source_index.row()
         
-
+        try:
+            selected_row_data = self._dataframe.iloc[row]
+            
+            if not isinstance(selected_row_data, pd.Series):
+                 raise TypeError("Dados extraídos não são uma Series do pandas.")
+            
+        except IndexError:
+            print("Erro: Índice da linha fora dos limites do DataFrame.")
+            return
+        except Exception as e:
+            print(f"Erro ao extrair linha: {e}")
+            return
+        
+        resolution = self.prepare_ai_resolution(selected_row_data)
+        print("\n--- RESOLUÇÃO ---")
+        print(resolution)
+        print("-----------------------\n")
+    
 # =============================================================
 # 4. BLOCO DE EXECUÇÃO
 
